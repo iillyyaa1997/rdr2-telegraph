@@ -91,7 +91,8 @@ struct Settings {
   bool enabled = true, autoTranslate = true, preTranslate = true, capture = false, useRuText = true;
   std::string language = "auto";
   std::vector<std::string> providers;
-  int maxPerMinute = 30, maxPerDay = 2000;
+  int maxPerDay = 2000;
+  int googleRate = 6, deeplRate = 30, deepseekRate = 30, openaiRate = 30;  // requests per minute
   std::string deeplKey;
   std::string deepseekKey, deepseekModel, deepseekUrl;
   std::string openaiKey, openaiModel, openaiUrl;
@@ -413,7 +414,8 @@ uint64_t g_cacheSig = 0;
 
 struct Job {
   std::string module, key;
-  bool literal = false, high = false, single = false;
+  bool literal = false, high = false;
+  uint16_t maxBatch = 0;  // after an answer that did not fit: smaller batches
   uint8_t tried = 0;  // provider bits that failed on this text
 };
 std::deque<Job> g_high, g_low;
@@ -808,30 +810,37 @@ const char* kDefaultIni =
     "Providers=google,deepl,deepseek,openai\r\n"
     "; translate the text found inside each mod in the background, before it is shown\r\n"
     "PreTranslate=1\r\n"
-    "; requests per minute to each service, and per day to all of them (0 = no limit)\r\n"
-    "MaxPerMinute=30\r\n"
+    "; requests per day to all services together (0 = no limit)\r\n"
     "MaxPerDay=2000\r\n"
     "; 1 = list text without any translation in Telegraph\\untranslated\\<Mod>.txt\r\n"
     "Capture=0\r\n"
     "; 1 = also read the dictionaries in the RuText folder\r\n"
     "UseRuTextDictionaries=1\r\n"
     "\r\n"
+    "[Google]\r\n"
+    "; Google Translate without a key (the endpoint browser extensions use). It answers\r\n"
+    "; \"too many requests\" for a while when asked too often: keep this low\r\n"
+    "MaxPerMinute=6\r\n"
+    "\r\n"
     "[DeepL]\r\n"
     "; API key (Free or Pro) from https://www.deepl.com/your-account/keys\r\n"
     "Key=\r\n"
+    "MaxPerMinute=30\r\n"
     "\r\n"
     "[DeepSeek]\r\n"
     "; API key from https://platform.deepseek.com/api_keys\r\n"
     "Key=\r\n"
     "Model=deepseek-chat\r\n"
     "Endpoint=https://api.deepseek.com/chat/completions\r\n"
+    "MaxPerMinute=30\r\n"
     "\r\n"
     "[OpenAI]\r\n"
     "; any OpenAI-compatible chat completions service: OpenAI, OpenRouter, a local\r\n"
     "; LM Studio or Ollama (http://localhost:11434/v1/chat/completions, no key)\r\n"
     "Key=\r\n"
     "Model=\r\n"
-    "Endpoint=https://api.openai.com/v1/chat/completions\r\n";
+    "Endpoint=https://api.openai.com/v1/chat/completions\r\n"
+    "MaxPerMinute=30\r\n";
 
 std::string IniStr(const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
   wchar_t buf[2048];
@@ -868,7 +877,10 @@ void ReadIni() {
     if (!p.empty()) s.providers.push_back(p);
     a = b + 1;
   }
-  s.maxPerMinute = std::max(1, IniInt(L"Telegraph", L"MaxPerMinute", 30));
+  s.googleRate = std::max(1, IniInt(L"Google", L"MaxPerMinute", 6));
+  s.deeplRate = std::max(1, IniInt(L"DeepL", L"MaxPerMinute", 30));
+  s.deepseekRate = std::max(1, IniInt(L"DeepSeek", L"MaxPerMinute", 30));
+  s.openaiRate = std::max(1, IniInt(L"OpenAI", L"MaxPerMinute", 30));
   s.maxPerDay = std::max(0, IniInt(L"Telegraph", L"MaxPerDay", 2000));
   s.deeplKey = IniStr(L"DeepL", L"Key", L"");
   s.deepseekKey = IniStr(L"DeepSeek", L"Key", L"");
@@ -962,7 +974,8 @@ struct Provider {
   uint8_t bit = 0;
   std::string key, model, url;
   size_t maxItems = 1, maxChars = 1;
-  int timeoutMs = 15000;
+  int timeoutMs = 15000, perMinute = 30;
+  ULONGLONG firstPause = 30000, maxPause = 15 * 60000;
   bool usable = false, disabled = false;
   ULONGLONG cooldownUntil = 0, backoff = 0;
   std::deque<ULONGLONG> sent;
@@ -981,7 +994,7 @@ std::string Why(const HttpResp& r) {
   if (!r.status) snprintf(b, sizeof b, "no answer (error %lu)", (unsigned long)r.error);
   else snprintf(b, sizeof b, "HTTP %d", r.status);
   std::string s = b;
-  if (r.status && !r.body.empty()) s += ": " + Short(r.body, 160);
+  if (r.status && !r.body.empty() && r.body[0] != '<') s += ": " + Short(r.body, 160);
   return s;
 }
 
@@ -1069,17 +1082,19 @@ std::vector<Provider> BuildProviders(const Settings& s) {
     Provider p;
     p.name = n;
     if (n == "google") {
-      p.kind = Kind::Google, p.bit = 1, p.maxItems = 40, p.maxChars = 1800, p.usable = true;
+      // few large requests: the keyless endpoint blocks an address that asks often
+      p.kind = Kind::Google, p.bit = 1, p.maxItems = 100, p.maxChars = 4500, p.usable = true;
+      p.perMinute = s.googleRate, p.firstPause = 120000, p.maxPause = 60 * 60000;
     } else if (n == "deepl") {
-      p.kind = Kind::DeepL, p.bit = 2, p.maxItems = 40, p.maxChars = 6000, p.key = s.deeplKey;
+      p.kind = Kind::DeepL, p.bit = 2, p.maxItems = 40, p.maxChars = 6000, p.key = s.deeplKey, p.perMinute = s.deeplRate;
       p.usable = !p.key.empty();
     } else if (n == "deepseek") {
       p.kind = Kind::Chat, p.bit = 4, p.maxItems = 30, p.maxChars = 3000, p.key = s.deepseekKey;
-      p.model = s.deepseekModel, p.url = s.deepseekUrl, p.timeoutMs = 90000;
+      p.model = s.deepseekModel, p.url = s.deepseekUrl, p.timeoutMs = 90000, p.perMinute = s.deepseekRate;
       p.usable = !p.key.empty() && !p.url.empty();
     } else if (n == "openai") {
       p.kind = Kind::Chat, p.bit = 8, p.maxItems = 30, p.maxChars = 3000, p.key = s.openaiKey;
-      p.model = s.openaiModel, p.url = s.openaiUrl, p.timeoutMs = 90000;
+      p.model = s.openaiModel, p.url = s.openaiUrl, p.timeoutMs = 90000, p.perMinute = s.openaiRate;
       p.usable = !p.model.empty() && !p.url.empty();
     } else {
       Log("Providers: unknown service '%s' skipped", n.c_str());
@@ -1228,11 +1243,16 @@ DWORD WINAPI Worker(LPVOID) {
     // providers follow Telegraph.ini; state (cooldowns) is kept per name
     std::string pk;
     for (const auto& p : set.providers) pk += p + ",";
-    pk += set.deeplKey + "|" + set.deepseekKey + "|" + set.deepseekModel + "|" + set.deepseekUrl + "|" +
+    pk += std::to_string(set.googleRate) + "|" + std::to_string(set.deeplRate) + "|" + std::to_string(set.deepseekRate) + "|" +
+          std::to_string(set.openaiRate) + "|" + set.deeplKey + "|" + set.deepseekKey + "|" + set.deepseekModel + "|" + set.deepseekUrl + "|" +
           set.openaiKey + "|" + set.openaiModel + "|" + set.openaiUrl;
     if (pk != provKey) {
       provKey = pk;
-      provs = BuildProviders(set);
+      std::vector<Provider> next = BuildProviders(set);
+      for (auto& n : next)
+        for (auto& o : provs)
+          if (o.name == n.name && o.key == n.key) n.cooldownUntil = o.cooldownUntil, n.backoff = o.backoff, n.sent = o.sent;
+      provs = std::move(next);
       std::string list;
       for (const auto& p : provs)
         if (p.usable) list += (list.empty() ? "" : ", ") + p.name;
@@ -1270,7 +1290,9 @@ DWORD WINAPI Worker(LPVOID) {
       for (auto& pr : provs) {
         if (!pr.usable || pr.disabled || (head.tried & pr.bit)) continue;
         left = true;
-        if (now >= pr.cooldownUntil && RateOk(pr, now, set.maxPerMinute)) {
+        // pre-translation leaves one request a minute for text that is on screen now
+        int rate = q == &g_low && pr.perMinute > 1 ? pr.perMinute - 1 : pr.perMinute;
+        if (now >= pr.cooldownUntil && RateOk(pr, now, rate)) {
           p = &pr;
           break;
         }
@@ -1293,10 +1315,10 @@ DWORD WINAPI Worker(LPVOID) {
         }
       } else if (p) {
         size_t chars = 0;
-        while (!q->empty() && batch.size() < p->maxItems) {
+        size_t limit = head.maxBatch ? std::min<size_t>(head.maxBatch, p->maxItems) : p->maxItems;
+        while (!q->empty() && batch.size() < limit) {
           Job& j = q->front();
-          if ((j.tried & p->bit) || (!batch.empty() && (j.single || batch[0].single)) ||
-              (p->kind == Kind::Chat && !batch.empty() && j.module != batch[0].module))
+          if ((j.tried & p->bit) || (p->kind == Kind::Chat && !batch.empty() && j.module != batch[0].module))
             break;
           if (!batch.empty() && chars + j.key.size() > p->maxChars) break;
           chars += j.key.size() + 1;
@@ -1345,15 +1367,16 @@ DWORD WINAPI Worker(LPVOID) {
         p->disabled = true;
         Log("%s: key rejected (%s): service off until Telegraph.ini changes", p->name.c_str(), rep.why.c_str());
       } else {
-        p->backoff = p->backoff ? std::min<ULONGLONG>(p->backoff * 2, 15 * 60000) : 30000;
+        p->backoff = p->backoff ? std::min<ULONGLONG>(p->backoff * 2, p->maxPause) : p->firstPause;
         p->cooldownUntil = GetTickCount64() + p->backoff;
         Log("%s: %s: pause %llu s", p->name.c_str(), rep.why.c_str(), p->backoff / 1000);
       }
       requeueFront(batch);
     } else if (rep.result == Result::Bad && batch.size() > 1) {
-      // answer did not fit the batch: try the texts one by one
-      for (auto& j : batch) j.single = true;
-      Log("%s: %s: retrying %d texts one by one", p->name.c_str(), rep.why.c_str(), (int)batch.size());
+      // answer did not fit the batch: try again in halves
+      uint16_t half = (uint16_t)std::max<size_t>(1, batch.size() / 2);
+      for (auto& j : batch) j.maxBatch = half;
+      Log("%s: %s: retrying %d texts in batches of %d", p->name.c_str(), rep.why.c_str(), (int)batch.size(), half);
       requeueFront(batch);
     } else {
       p->backoff = 0;
@@ -1370,7 +1393,7 @@ DWORD WINAPI Worker(LPVOID) {
         } else {
           // a placeholder got lost: another service may do better
           j.tried |= p->bit;
-          j.single = false;
+          j.maxBatch = 0;
           ++bad;
           if (bad <= 3)
             Log("%s: rejected for [%s] %s -> %s", p->name.c_str(), j.module.c_str(), Short(j.key).c_str(),

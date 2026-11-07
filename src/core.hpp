@@ -638,7 +638,8 @@ inline std::string LlmSystemPrompt(const Lang& lang, const std::vector<std::pair
 inline std::string ChatBody(const std::string& model, const std::string& system, const std::string& user) {
   std::string b = "{";
   if (!model.empty()) b += "\"model\":" + JsonQuote(model) + ",";
-  b += "\"temperature\":0.2,\"messages\":[{\"role\":\"system\",\"content\":" + JsonQuote(system) +
+  // no temperature: some newer models reject the parameter
+  b += "\"messages\":[{\"role\":\"system\",\"content\":" + JsonQuote(system) +
        "},{\"role\":\"user\",\"content\":" + JsonQuote(user) + "}]}";
   return b;
 }
