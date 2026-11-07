@@ -92,7 +92,8 @@ struct Settings {
   std::string language = "auto";
   std::vector<std::string> providers;
   int maxPerDay = 2000;
-  int googleRate = 6, deeplRate = 30, deepseekRate = 30, openaiRate = 30;  // requests per minute
+  int googleRate = 3, deeplRate = 30, deepseekRate = 30, openaiRate = 30;  // requests per minute
+  int googleChars = 2000, googlePreHour = 30000;  // characters per request; pre-translation per hour
   std::string deeplKey;
   std::string deepseekKey, deepseekModel, deepseekUrl;
   std::string openaiKey, openaiModel, openaiUrl;
@@ -416,9 +417,11 @@ struct Job {
   std::string module, key;
   bool literal = false, high = false;
   uint16_t maxBatch = 0;  // after an answer that did not fit: smaller batches
+  ULONGLONG at = 0;       // when it was queued
   uint8_t tried = 0;  // provider bits that failed on this text
 };
 std::deque<Job> g_high, g_low;
+ULONGLONG g_lastHighAt = 0;  // a menu that opens sends its lines over a few frames
 std::unordered_set<std::string> g_pending, g_failed;  // module + '\x01' + key
 
 // translated strings live forever (CREATE_VAR_STRING may keep the pointer briefly);
@@ -547,6 +550,8 @@ void Enqueue(const std::string& module, const std::string& key, bool literal, bo
   j.key = key;
   j.literal = literal;
   j.high = high;
+  j.at = GetTickCount64();
+  if (high) g_lastHighAt = j.at;
   (high ? g_high : g_low).push_back(std::move(j));
   WakeConditionVariable(&g_wake);
 }
@@ -819,8 +824,12 @@ const char* kDefaultIni =
     "\r\n"
     "[Google]\r\n"
     "; Google Translate without a key (the endpoint browser extensions use). It answers\r\n"
-    "; \"too many requests\" for a while when asked too often: keep this low\r\n"
-    "MaxPerMinute=6\r\n"
+    "; \"too many requests\" for hours when asked too much: keep these low\r\n"
+    "MaxPerMinute=3\r\n"
+    "; characters per request\r\n"
+    "MaxChars=2000\r\n"
+    "; characters per hour for background pre-translation (0 = only text on screen)\r\n"
+    "PreTranslateCharsPerHour=30000\r\n"
     "\r\n"
     "[DeepL]\r\n"
     "; API key (Free or Pro) from https://www.deepl.com/your-account/keys\r\n"
@@ -877,7 +886,9 @@ void ReadIni() {
     if (!p.empty()) s.providers.push_back(p);
     a = b + 1;
   }
-  s.googleRate = std::max(1, IniInt(L"Google", L"MaxPerMinute", 6));
+  s.googleRate = std::max(1, IniInt(L"Google", L"MaxPerMinute", 3));
+  s.googleChars = std::max(200, IniInt(L"Google", L"MaxChars", 2000));
+  s.googlePreHour = std::max(0, IniInt(L"Google", L"PreTranslateCharsPerHour", 30000));
   s.deeplRate = std::max(1, IniInt(L"DeepL", L"MaxPerMinute", 30));
   s.deepseekRate = std::max(1, IniInt(L"DeepSeek", L"MaxPerMinute", 30));
   s.openaiRate = std::max(1, IniInt(L"OpenAI", L"MaxPerMinute", 30));
@@ -979,6 +990,9 @@ struct Provider {
   bool usable = false, disabled = false;
   ULONGLONG cooldownUntil = 0, backoff = 0;
   std::deque<ULONGLONG> sent;
+  size_t preCharsPerHour = 0;  // 0 = no limit
+  bool preAllowed = true;      // false: only text that is on screen
+  std::deque<std::pair<ULONGLONG, size_t>> preSent;  // pre-translation characters of the last hour
 };
 
 enum class Result { Ok, Retry, Auth, Bad };
@@ -1083,8 +1097,10 @@ std::vector<Provider> BuildProviders(const Settings& s) {
     p.name = n;
     if (n == "google") {
       // few large requests: the keyless endpoint blocks an address that asks often
-      p.kind = Kind::Google, p.bit = 1, p.maxItems = 100, p.maxChars = 4500, p.usable = true;
+      p.kind = Kind::Google, p.bit = 1, p.maxItems = 100, p.maxChars = (size_t)s.googleChars, p.usable = true;
       p.perMinute = s.googleRate, p.firstPause = 120000, p.maxPause = 60 * 60000;
+      p.preCharsPerHour = (size_t)s.googlePreHour;
+      p.preAllowed = s.googlePreHour > 0;
     } else if (n == "deepl") {
       p.kind = Kind::DeepL, p.bit = 2, p.maxItems = 40, p.maxChars = 6000, p.key = s.deeplKey, p.perMinute = s.deeplRate;
       p.usable = !p.key.empty();
@@ -1243,7 +1259,7 @@ DWORD WINAPI Worker(LPVOID) {
     // providers follow Telegraph.ini; state (cooldowns) is kept per name
     std::string pk;
     for (const auto& p : set.providers) pk += p + ",";
-    pk += std::to_string(set.googleRate) + "|" + std::to_string(set.deeplRate) + "|" + std::to_string(set.deepseekRate) + "|" +
+    pk += std::to_string(set.googleRate) + "|" + std::to_string(set.googleChars) + "|" + std::to_string(set.googlePreHour) + "|" + std::to_string(set.deeplRate) + "|" + std::to_string(set.deepseekRate) + "|" +
           std::to_string(set.openaiRate) + "|" + set.deeplKey + "|" + set.deepseekKey + "|" + set.deepseekModel + "|" + set.deepseekUrl + "|" +
           set.openaiKey + "|" + set.openaiModel + "|" + set.openaiUrl;
     if (pk != provKey) {
@@ -1251,7 +1267,8 @@ DWORD WINAPI Worker(LPVOID) {
       std::vector<Provider> next = BuildProviders(set);
       for (auto& n : next)
         for (auto& o : provs)
-          if (o.name == n.name && o.key == n.key) n.cooldownUntil = o.cooldownUntil, n.backoff = o.backoff, n.sent = o.sent;
+          if (o.name == n.name && o.key == n.key)
+            n.cooldownUntil = o.cooldownUntil, n.backoff = o.backoff, n.sent = o.sent, n.preSent = o.preSent;
       provs = std::move(next);
       std::string list;
       for (const auto& p : provs)
@@ -1284,15 +1301,37 @@ DWORD WINAPI Worker(LPVOID) {
       continue;
     }
     std::deque<Job>* q = !g_high.empty() ? &g_high : !g_low.empty() ? &g_low : nullptr;
+    // text that just appeared: wait until the screen settles (0.8 s without new text,
+    // at most 2.5 s) and send it in one request
+    if (q == &g_high && now < g_lastHighAt + 800 && now < q->front().at + 2500) {
+      ReleaseSRWLockExclusive(&g_lock);
+      Sleep(200);
+      continue;
+    }
     if (q) {
       Job& head = q->front();
       bool left = false;
       for (auto& pr : provs) {
         if (!pr.usable || pr.disabled || (head.tried & pr.bit)) continue;
         left = true;
+        if (q == &g_low && !pr.preAllowed) {
+          if (!waitMs || 60000 < waitMs) waitMs = 60000;
+          continue;
+        }
         // pre-translation leaves one request a minute for text that is on screen now
         int rate = q == &g_low && pr.perMinute > 1 ? pr.perMinute - 1 : pr.perMinute;
-        if (now >= pr.cooldownUntil && RateOk(pr, now, rate)) {
+        bool budget = true;
+        if (q == &g_low && pr.preCharsPerHour) {
+          while (!pr.preSent.empty() && now - pr.preSent.front().first >= 3600000) pr.preSent.pop_front();
+          size_t used = 0;
+          for (const auto& e : pr.preSent) used += e.second;
+          budget = used < pr.preCharsPerHour;
+          if (!budget && !pr.preSent.empty()) {
+            ULONGLONG w = 3600000 - (now - pr.preSent.front().first);
+            if (!waitMs || w < waitMs) waitMs = w;
+          }
+        }
+        if (now >= pr.cooldownUntil && budget && RateOk(pr, now, rate)) {
           p = &pr;
           break;
         }
@@ -1346,6 +1385,11 @@ DWORD WINAPI Worker(LPVOID) {
       texts.push_back(prot.back().text);
     }
     p->sent.push_back(now);
+    if (!batch[0].high) {
+      size_t chars = 0;
+      for (const auto& t : texts) chars += t.size() + 1;
+      p->preSent.emplace_back(now, chars);
+    }
     CountRequest();
     ULONGLONG t0 = GetTickCount64();
     Reply rep = p->kind == Kind::Google  ? CallGoogle(*p, texts, *target)
