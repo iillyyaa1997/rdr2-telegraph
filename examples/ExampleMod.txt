@@ -1,0 +1,14 @@
+# Your dictionary for ExampleMod.asi. Put it into <game>\Telegraph\ as ExampleMod.txt (the part
+# before the first dot selects the mod; _common.txt applies to every mod). UTF-8.
+# Your lines win over machine translation. Changes are picked up while the game runs.
+
+# exact line
+Open Menu => Открыть меню
+# pattern: each * captures text and is put back in the same order
+You paid $*. They rode off. => Ты заплатил $*. Они ускакали.
+# pattern with numbered captures, for a different word order
+Day * of * => {2}: день {1}
+# ~ replaces the text inside any longer line (also a glossary hint for AI services)
+~Valentine => Валентайн
+# \n and \t work on both sides
+First line\nSecond line => Первая строка\nВторая строка
