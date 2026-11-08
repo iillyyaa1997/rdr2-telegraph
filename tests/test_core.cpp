@@ -145,6 +145,28 @@ int main() {
     EQ(keys.size(), (size_t)3);
     EQ(keys[1], std::string("Reward: $*"));
   }
+  // Google Cloud, Azure, MyMemory
+  {
+    const tg::Lang& ru = *tg::LangByGame(7);
+    EQ(tg::GoogleCloudBody({"a"}, ru), std::string(R"({"q":["a"],"target":"ru","format":"text"})"));
+    std::vector<std::string> out;
+    CHECK(tg::ParseGoogleCloud(R"({"data":{"translations":[{"translatedText":"Да","detectedSourceLanguage":"en"},{"translatedText":"Нет"}]}})", out));
+    EQ(out.size(), (size_t)2);
+    EQ(out[1], std::string("Нет"));
+    CHECK(!tg::ParseGoogleCloud(R"({"error":{"code":403}})", out));
+    EQ(tg::MicrosoftBody({"a", "b\""}), std::string(R"([{"Text":"a"},{"Text":"b\""}])"));
+    CHECK(tg::ParseMicrosoft(R"([{"detectedLanguage":{"language":"en","score":1.0},"translations":[{"text":"Привет","to":"ru"}]},{"translations":[{"text":"Мир","to":"ru"}]}])", out));
+    EQ(out.size(), (size_t)2);
+    EQ(out[0], std::string("Привет"));
+    EQ(std::string(tg::LangByGame(12)->microsoft), std::string("zh-Hans"));
+    std::string t;
+    // answer captured from api.mymemory.translated.net 2026-11-08
+    CHECK(tg::ParseMyMemory(R"({"responseData":{"translatedText":"Скрытие очищено. Разграбьте лагерь и нажмите {0}.","match":0.85},"quotaFinished":false,"mtLangSupported":null,"responseDetails":"","responseStatus":200})", t) == tg::MyMemoryResult::Ok);
+    EQ(t, std::string("Скрытие очищено. Разграбьте лагерь и нажмите {0}."));
+    CHECK(tg::ParseMyMemory(R"({"responseData":{"translatedText":"MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS FOR TODAY."},"quotaFinished":true,"responseStatus":429})", t) == tg::MyMemoryResult::Quota);
+    CHECK(tg::ParseMyMemory(R"({"responseData":{"translatedText":"MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS FOR TODAY. NEXT AVAILABLE IN 10 HOURS"},"responseStatus":"200"})", t) == tg::MyMemoryResult::Quota);
+    CHECK(tg::ParseMyMemory(R"({"responseData":{"translatedText":"x"},"responseStatus":"403"})", t) == tg::MyMemoryResult::Bad);
+  }
   // languages
   {
     EQ(std::string(tg::LangByGame(7)->code), std::string("ru"));

@@ -506,24 +506,26 @@ struct Lang {
   const char* code;  // cache folder and Telegraph.ini Language=
   const char* google;
   const char* deepl;
-  const char* name;  // for the LLM prompt
+  const char* name;       // for the LLM prompt
+  const char* microsoft;  // Azure Translator
+  const char* mymemory;
 };
 
 inline const Lang* Langs(size_t& n) {
   static const Lang k[] = {
-      {0, "en", "en", "EN-US", "English"},
-      {1, "fr", "fr", "FR", "French"},
-      {2, "de", "de", "DE", "German"},
-      {3, "it", "it", "IT", "Italian"},
-      {4, "es", "es", "ES", "Spanish (Spain)"},
-      {5, "pt-BR", "pt", "PT-BR", "Brazilian Portuguese"},
-      {6, "pl", "pl", "PL", "Polish"},
-      {7, "ru", "ru", "RU", "Russian"},
-      {8, "ko", "ko", "KO", "Korean"},
-      {9, "zh-TW", "zh-TW", "ZH-HANT", "Traditional Chinese"},
-      {10, "ja", "ja", "JA", "Japanese"},
-      {11, "es-MX", "es", "ES", "Latin American Spanish"},
-      {12, "zh-CN", "zh-CN", "ZH-HANS", "Simplified Chinese"},
+      {0, "en", "en", "EN-US", "English", "en", "en-US"},
+      {1, "fr", "fr", "FR", "French", "fr", "fr-FR"},
+      {2, "de", "de", "DE", "German", "de", "de-DE"},
+      {3, "it", "it", "IT", "Italian", "it", "it-IT"},
+      {4, "es", "es", "ES", "Spanish (Spain)", "es", "es-ES"},
+      {5, "pt-BR", "pt", "PT-BR", "Brazilian Portuguese", "pt", "pt-BR"},
+      {6, "pl", "pl", "PL", "Polish", "pl", "pl-PL"},
+      {7, "ru", "ru", "RU", "Russian", "ru", "ru-RU"},
+      {8, "ko", "ko", "KO", "Korean", "ko", "ko-KR"},
+      {9, "zh-TW", "zh-TW", "ZH-HANT", "Traditional Chinese", "zh-Hant", "zh-TW"},
+      {10, "ja", "ja", "JA", "Japanese", "ja", "ja-JP"},
+      {11, "es-MX", "es", "ES", "Latin American Spanish", "es", "es-MX"},
+      {12, "zh-CN", "zh-CN", "ZH-HANS", "Simplified Chinese", "zh-Hans", "zh-CN"},
   };
   n = sizeof k / sizeof k[0];
   return k;
@@ -616,6 +618,68 @@ inline bool ParseDeepL(const std::string& body, std::vector<std::string>& out) {
     out.push_back(x->str);
   }
   return true;
+}
+
+// Google Cloud Translation v2 (key): {"data":{"translations":[{"translatedText":...}]}}
+inline std::string GoogleCloudBody(const std::vector<std::string>& texts, const Lang& lang) {
+  return std::string("{\"q\":") + JsonStringArray(texts) + ",\"target\":" + JsonQuote(lang.google) +
+         ",\"format\":\"text\"}";
+}
+
+inline bool ParseGoogleCloud(const std::string& body, std::vector<std::string>& out) {
+  Json j;
+  if (!ParseJson(body, j)) return false;
+  const Json* d = j.Get("data");
+  const Json* tr = d ? d->Get("translations") : nullptr;
+  if (!tr || tr->type != Json::Array) return false;
+  out.clear();
+  for (const Json& t : tr->arr) {
+    const Json* x = t.Get("translatedText");
+    if (!x || x->type != Json::String) return false;
+    out.push_back(x->str);
+  }
+  return true;
+}
+
+// Azure Translator v3: body [{"Text":...}], answer [{"translations":[{"text":...,"to":...}]}]
+inline std::string MicrosoftBody(const std::vector<std::string>& texts) {
+  std::string b = "[";
+  for (size_t i = 0; i < texts.size(); ++i) b += (i ? ",{\"Text\":" : "{\"Text\":") + JsonQuote(texts[i]) + "}";
+  return b + "]";
+}
+
+inline bool ParseMicrosoft(const std::string& body, std::vector<std::string>& out) {
+  Json j;
+  if (!ParseJson(body, j) || j.type != Json::Array) return false;
+  out.clear();
+  for (const Json& e : j.arr) {
+    const Json* tr = e.Get("translations");
+    const Json* t0 = tr ? tr->At(0) : nullptr;
+    const Json* x = t0 ? t0->Get("text") : nullptr;
+    if (!x || x->type != Json::String) return false;
+    out.push_back(x->str);
+  }
+  return true;
+}
+
+// MyMemory (no key, one text per request): {"responseData":{"translatedText":...},"responseStatus":200,
+// "quotaFinished":false}. When the daily quota is used up it may still answer 200 with a warning
+// as the "translation"; that counts as quota, not as text.
+enum class MyMemoryResult { Ok, Quota, Bad };
+inline MyMemoryResult ParseMyMemory(const std::string& body, std::string& out) {
+  Json j;
+  if (!ParseJson(body, j)) return MyMemoryResult::Bad;
+  const Json* st = j.Get("responseStatus");
+  const Json* qf = j.Get("quotaFinished");
+  const Json* rd = j.Get("responseData");
+  const Json* tt = rd ? rd->Get("translatedText") : nullptr;
+  int status = !st ? 0 : st->type == Json::Number ? (int)st->num : st->type == Json::String ? atoi(st->str.c_str()) : 0;
+  bool quota = (qf && qf->type == Json::Bool && qf->b) || status == 429 ||
+               (tt && tt->type == Json::String && tt->str.compare(0, 16, "MYMEMORY WARNING") == 0);
+  if (quota) return MyMemoryResult::Quota;
+  if (status != 200 || !tt || tt->type != Json::String) return MyMemoryResult::Bad;
+  out = tt->str;
+  return MyMemoryResult::Ok;
 }
 
 inline std::string LlmSystemPrompt(const Lang& lang, const std::vector<std::pair<std::string, std::string>>& glossary) {

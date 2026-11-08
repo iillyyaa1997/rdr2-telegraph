@@ -94,7 +94,8 @@ struct Settings {
   int maxPerDay = 2000;
   int googleRate = 3, deeplRate = 30, deepseekRate = 30, openaiRate = 30;  // requests per minute
   int googleChars = 2000, googlePreHour = 30000;  // characters per request; pre-translation per hour
-  std::string deeplKey;
+  std::string deeplKey, googleCloudKey, microsoftKey, microsoftRegion, mymemoryEmail;
+  int googleCloudRate = 30, microsoftRate = 30, mymemoryRate = 10;
   std::string deepseekKey, deepseekModel, deepseekUrl;
   std::string openaiKey, openaiModel, openaiUrl;
 };
@@ -811,8 +812,9 @@ const char* kDefaultIni =
     "; target language: auto = the language of the game, or one of\r\n"
     "; fr de it es pt-BR pl ru ko zh-TW ja es-MX zh-CN\r\n"
     "Language=auto\r\n"
-    "; services in the order they are tried; one without a key is skipped\r\n"
-    "Providers=google,deepl,deepseek,openai\r\n"
+    "; services in the order they are tried. A service that needs a key is skipped\r\n"
+    "; until you enter one, so by default the two free ones at the end do the work\r\n"
+    "Providers=deepl,googlecloud,microsoft,deepseek,openai,google,mymemory\r\n"
     "; translate the text found inside each mod in the background, before it is shown\r\n"
     "PreTranslate=1\r\n"
     "; requests per day to all services together (0 = no limit)\r\n"
@@ -823,17 +825,37 @@ const char* kDefaultIni =
     "UseRuTextDictionaries=1\r\n"
     "\r\n"
     "[Google]\r\n"
-    "; Google Translate without a key (the endpoint browser extensions use). It answers\r\n"
-    "; \"too many requests\" for hours when asked too much: keep these low\r\n"
+    "; Google Translate without a key: the unofficial endpoint browser extensions use.\r\n"
+    "; Google blocks it now and then (\"too many requests\"), for hours, in some regions\r\n"
+    "; for everyone. Telegraph then pauses it and the next service takes over.\r\n"
     "MaxPerMinute=3\r\n"
     "; characters per request\r\n"
     "MaxChars=2000\r\n"
     "; characters per hour for background pre-translation (0 = only text on screen)\r\n"
     "PreTranslateCharsPerHour=30000\r\n"
     "\r\n"
+    "[MyMemory]\r\n"
+    "; free, no key, only for text on screen: 5000 characters a day, 50000 with an\r\n"
+    "; e-mail address here (MyMemory uses it to contact you about your usage)\r\n"
+    "Email=\r\n"
+    "MaxPerMinute=10\r\n"
+    "\r\n"
     "[DeepL]\r\n"
-    "; API key (Free or Pro) from https://www.deepl.com/your-account/keys\r\n"
+    "; DeepL API key (Developer, Pro or an old Free key ending in :fx)\r\n"
     "Key=\r\n"
+    "MaxPerMinute=30\r\n"
+    "\r\n"
+    "[GoogleCloud]\r\n"
+    "; Google Cloud Translation API key (500,000 characters a month free, billing\r\n"
+    "; account needed): console.cloud.google.com, enable \"Cloud Translation API\"\r\n"
+    "Key=\r\n"
+    "MaxPerMinute=30\r\n"
+    "\r\n"
+    "[Microsoft]\r\n"
+    "; Azure AI Translator key (free tier F0: 2 million characters a month) and the\r\n"
+    "; region of the resource, e.g. westeurope (empty for a global resource)\r\n"
+    "Key=\r\n"
+    "Region=\r\n"
     "MaxPerMinute=30\r\n"
     "\r\n"
     "[DeepSeek]\r\n"
@@ -878,7 +900,7 @@ void ReadIni() {
   s.capture = IniInt(L"Telegraph", L"Capture", 0) != 0;
   s.useRuText = IniInt(L"Telegraph", L"UseRuTextDictionaries", 1) != 0;
   s.language = IniStr(L"Telegraph", L"Language", L"auto");
-  std::string prov = Lower(IniStr(L"Telegraph", L"Providers", L"google,deepl,deepseek,openai"));
+  std::string prov = Lower(IniStr(L"Telegraph", L"Providers", L"deepl,googlecloud,microsoft,deepseek,openai,google,mymemory"));
   for (size_t a = 0; a <= prov.size();) {
     size_t b = prov.find(',', a);
     if (b == std::string::npos) b = prov.size();
@@ -894,6 +916,13 @@ void ReadIni() {
   s.openaiRate = std::max(1, IniInt(L"OpenAI", L"MaxPerMinute", 30));
   s.maxPerDay = std::max(0, IniInt(L"Telegraph", L"MaxPerDay", 2000));
   s.deeplKey = IniStr(L"DeepL", L"Key", L"");
+  s.googleCloudKey = IniStr(L"GoogleCloud", L"Key", L"");
+  s.googleCloudRate = std::max(1, IniInt(L"GoogleCloud", L"MaxPerMinute", 30));
+  s.microsoftKey = IniStr(L"Microsoft", L"Key", L"");
+  s.microsoftRegion = IniStr(L"Microsoft", L"Region", L"");
+  s.microsoftRate = std::max(1, IniInt(L"Microsoft", L"MaxPerMinute", 30));
+  s.mymemoryEmail = IniStr(L"MyMemory", L"Email", L"");
+  s.mymemoryRate = std::max(1, IniInt(L"MyMemory", L"MaxPerMinute", 10));
   s.deepseekKey = IniStr(L"DeepSeek", L"Key", L"");
   s.deepseekModel = IniStr(L"DeepSeek", L"Model", L"deepseek-chat");
   s.deepseekUrl = IniStr(L"DeepSeek", L"Endpoint", L"https://api.deepseek.com/chat/completions");
@@ -977,7 +1006,7 @@ HttpResp Http(const std::string& url, const std::string& headers, const std::str
 
 // ---------------------------------------------------------------- providers
 
-enum class Kind { Google, DeepL, Chat };
+enum class Kind { Google, DeepL, Chat, GoogleCloud, Microsoft, MyMemory };
 
 struct Provider {
   std::string name;
@@ -995,7 +1024,7 @@ struct Provider {
   std::deque<std::pair<ULONGLONG, size_t>> preSent;  // pre-translation characters of the last hour
 };
 
-enum class Result { Ok, Retry, Auth, Bad };
+enum class Result { Ok, Retry, Auth, Bad, Quota };
 
 struct Reply {
   Result result = Result::Retry;
@@ -1044,6 +1073,74 @@ Reply CallGoogle(const Provider& p, const std::vector<std::string>& texts, const
     rep.result = Result::Bad;
     rep.why = "line count changed";
     rep.texts.clear();
+  }
+  return rep;
+}
+
+Reply CallGoogleCloud(const Provider& p, const std::vector<std::string>& texts, const tg::Lang& lang) {
+  Reply rep;
+  HttpResp r = Http("https://translation.googleapis.com/language/translate/v2?key=" + tg::UrlEncode(p.key),
+                    "Content-Type: application/json\r\n", tg::GoogleCloudBody(texts, lang), p.timeoutMs);
+  rep.result = Classify(r, true);
+  if (rep.result != Result::Ok) {
+    rep.why = Why(r);
+    return rep;
+  }
+  if (!tg::ParseGoogleCloud(r.body, rep.texts) || rep.texts.size() != texts.size()) {
+    rep.result = Result::Bad;
+    rep.why = "unreadable answer: " + Short(r.body, 160);
+    rep.texts.clear();
+  }
+  return rep;
+}
+
+Reply CallMicrosoft(const Provider& p, const std::vector<std::string>& texts, const tg::Lang& lang) {
+  Reply rep;
+  std::string headers = "Ocp-Apim-Subscription-Key: " + p.key + "\r\nContent-Type: application/json\r\n";
+  if (!p.model.empty()) headers += "Ocp-Apim-Subscription-Region: " + p.model + "\r\n";  // region
+  HttpResp r = Http("https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=" +
+                        std::string(lang.microsoft),
+                    headers, tg::MicrosoftBody(texts), p.timeoutMs);
+  rep.result = Classify(r, true);
+  if (rep.result != Result::Ok) {
+    rep.why = Why(r);
+    return rep;
+  }
+  if (!tg::ParseMicrosoft(r.body, rep.texts) || rep.texts.size() != texts.size()) {
+    rep.result = Result::Bad;
+    rep.why = "unreadable answer: " + Short(r.body, 160);
+    rep.texts.clear();
+  }
+  return rep;
+}
+
+// One text per request. A used-up daily quota pauses the service until tomorrow.
+Reply CallMyMemory(const Provider& p, const std::vector<std::string>& texts, const tg::Lang& lang) {
+  Reply rep;
+  if (texts.size() != 1 || texts[0].size() > 480) {
+    rep.result = Result::Bad;
+    rep.why = "too long for MyMemory";
+    return rep;
+  }
+  std::string url = "https://api.mymemory.translated.net/get?q=" + tg::UrlEncode(texts[0]) + "&langpair=en%7C" +
+                    std::string(lang.mymemory);
+  if (!p.key.empty()) url += "&de=" + tg::UrlEncode(p.key);  // e-mail
+  HttpResp r = Http(url, "", "", p.timeoutMs);
+  rep.result = Classify(r, false);
+  if (rep.result != Result::Ok) {
+    rep.why = Why(r);
+    return rep;
+  }
+  std::string out;
+  tg::MyMemoryResult m = tg::ParseMyMemory(r.body, out);
+  if (m == tg::MyMemoryResult::Quota) {
+    rep.result = Result::Quota;
+    rep.why = "daily quota used up";
+  } else if (m == tg::MyMemoryResult::Bad) {
+    rep.result = Result::Bad;
+    rep.why = "unreadable answer: " + Short(r.body, 160);
+  } else {
+    rep.texts.push_back(out);
   }
   return rep;
 }
@@ -1098,9 +1195,19 @@ std::vector<Provider> BuildProviders(const Settings& s) {
     if (n == "google") {
       // few large requests: the keyless endpoint blocks an address that asks often
       p.kind = Kind::Google, p.bit = 1, p.maxItems = 100, p.maxChars = (size_t)s.googleChars, p.usable = true;
-      p.perMinute = s.googleRate, p.firstPause = 120000, p.maxPause = 60 * 60000;
+      p.perMinute = s.googleRate, p.firstPause = 10 * 60000, p.maxPause = 60 * 60000;
       p.preCharsPerHour = (size_t)s.googlePreHour;
       p.preAllowed = s.googlePreHour > 0;
+    } else if (n == "googlecloud") {
+      p.kind = Kind::GoogleCloud, p.bit = 16, p.maxItems = 100, p.maxChars = 5000, p.key = s.googleCloudKey;
+      p.perMinute = s.googleCloudRate, p.usable = !p.key.empty();
+    } else if (n == "microsoft") {
+      p.kind = Kind::Microsoft, p.bit = 32, p.maxItems = 100, p.maxChars = 5000, p.key = s.microsoftKey;
+      p.model = s.microsoftRegion, p.perMinute = s.microsoftRate, p.usable = !p.key.empty();
+    } else if (n == "mymemory") {
+      // small daily quota: only for text that is on screen
+      p.kind = Kind::MyMemory, p.bit = 64, p.maxItems = 1, p.maxChars = 480, p.key = s.mymemoryEmail;
+      p.perMinute = s.mymemoryRate, p.usable = true, p.preAllowed = false;
     } else if (n == "deepl") {
       p.kind = Kind::DeepL, p.bit = 2, p.maxItems = 40, p.maxChars = 6000, p.key = s.deeplKey, p.perMinute = s.deeplRate;
       p.usable = !p.key.empty();
@@ -1259,6 +1366,9 @@ DWORD WINAPI Worker(LPVOID) {
     // providers follow Telegraph.ini; state (cooldowns) is kept per name
     std::string pk;
     for (const auto& p : set.providers) pk += p + ",";
+    pk += set.googleCloudKey + "|" + set.microsoftKey + "|" + set.microsoftRegion + "|" + set.mymemoryEmail + "|" +
+          std::to_string(set.googleCloudRate) + "|" + std::to_string(set.microsoftRate) + "|" +
+          std::to_string(set.mymemoryRate) + "|";
     pk += std::to_string(set.googleRate) + "|" + std::to_string(set.googleChars) + "|" + std::to_string(set.googlePreHour) + "|" + std::to_string(set.deeplRate) + "|" + std::to_string(set.deepseekRate) + "|" +
           std::to_string(set.openaiRate) + "|" + set.deeplKey + "|" + set.deepseekKey + "|" + set.deepseekModel + "|" + set.deepseekUrl + "|" +
           set.openaiKey + "|" + set.openaiModel + "|" + set.openaiUrl;
@@ -1392,9 +1502,12 @@ DWORD WINAPI Worker(LPVOID) {
     }
     CountRequest();
     ULONGLONG t0 = GetTickCount64();
-    Reply rep = p->kind == Kind::Google  ? CallGoogle(*p, texts, *target)
-                : p->kind == Kind::DeepL ? CallDeepL(*p, texts, *target)
-                                         : CallChat(*p, texts, *target, glossary);
+    Reply rep = p->kind == Kind::Google        ? CallGoogle(*p, texts, *target)
+                : p->kind == Kind::DeepL       ? CallDeepL(*p, texts, *target)
+                : p->kind == Kind::GoogleCloud ? CallGoogleCloud(*p, texts, *target)
+                : p->kind == Kind::Microsoft   ? CallMicrosoft(*p, texts, *target)
+                : p->kind == Kind::MyMemory    ? CallMyMemory(*p, texts, *target)
+                                               : CallChat(*p, texts, *target, glossary);
     ULONGLONG ms = GetTickCount64() - t0;
 
     AcquireSRWLockExclusive(&g_lock);
@@ -1406,8 +1519,11 @@ DWORD WINAPI Worker(LPVOID) {
       for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) (it->high ? g_high : g_low).push_front(std::move(*it));
     };
     int ok = 0, bad = 0;
-    if (rep.result == Result::Retry || rep.result == Result::Auth) {
-      if (rep.result == Result::Auth) {
+    if (rep.result == Result::Retry || rep.result == Result::Auth || rep.result == Result::Quota) {
+      if (rep.result == Result::Quota) {
+        p->cooldownUntil = GetTickCount64() + 6 * 3600000ULL;
+        Log("%s: %s: paused for 6 hours", p->name.c_str(), rep.why.c_str());
+      } else if (rep.result == Result::Auth) {
         p->disabled = true;
         Log("%s: key rejected (%s): service off until Telegraph.ini changes", p->name.c_str(), rep.why.c_str());
       } else {
